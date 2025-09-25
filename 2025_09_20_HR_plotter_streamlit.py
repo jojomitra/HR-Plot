@@ -9,6 +9,8 @@ import time
 import os
 
 # Try to import a fast KD-tree implementation (scipy preferred, sklearn fallback)
+KDTreeImpl = None
+KD_IMPL = None
 try:
     from scipy.spatial import cKDTree as KDTreeImpl
     KD_IMPL = "scipy"
@@ -165,12 +167,15 @@ def load_iso_age_points(filename):
         out[int(age)] = pts
     return out
 
-def kd_mean_distance_to_points(pts, star_coords_arr):
+def kd_mean_distance_to_points_using_kd(pts, star_coords_arr):
     """
-    Given pts (Nx2) and star_coords_arr (Mx2 numpy array or convertible), compute mean of minimal Euclidean distances
-    from each star to the pts. Uses KD-tree if available; otherwise a vectorized fallback.
+    Given pts (Nx2) and star_coords_arr (Mx2 numpy array), compute mean of minimal Euclidean distances
+    from each star to the pts using KD-tree only. If KD implementation missing, return np.inf.
     """
-    # explicit checks (avoid truth-testing numpy)
+    if KDTreeImpl is None:
+        # explicit behavior: no KD -> do not compute, return infinite score so Z is not suggested
+        return np.inf
+
     if pts is None or getattr(pts, "size", 0) == 0:
         return np.inf
     if star_coords_arr is None:
@@ -179,35 +184,23 @@ def kd_mean_distance_to_points(pts, star_coords_arr):
     if star_arr.size == 0:
         return np.inf
 
-    # prefer KD-tree implementation if available
-    if KDTreeImpl is not None:
-        try:
-            tree = KDTreeImpl(pts)
-            # query returns distances; different KD impls return slightly different shapes
-            res = tree.query(star_arr, k=1)
-            # res may be (dists, idx) or a single array depending on impl; handle generically:
-            if isinstance(res, tuple) and len(res) >= 1:
-                dists = np.asarray(res[0]).reshape(-1)
-            else:
-                dists = np.asarray(res).reshape(-1)
-            return float(np.mean(dists))
-        except Exception:
-            # fall through to fallback
-            pass
+    # Build KD tree and query
+    tree = KDTreeImpl(pts)
+    res = tree.query(star_arr, k=1)
+    # res may be tuple (dists, idx) or array; handle both
+    if isinstance(res, tuple) and len(res) >= 1:
+        dists = np.asarray(res[0]).reshape(-1)
+    else:
+        dists = np.asarray(res).reshape(-1)
+    return float(np.mean(dists))
 
-    # fallback: vectorized computation (M x N distances -> min over N)
-    diff = star_arr[:, None, :] - pts[None, :, :]  # (M, N, 2)
-    dists = np.sqrt(np.sum(diff ** 2, axis=2))  # (M, N)
-    min_per_star = np.min(dists, axis=1)
-    return float(np.mean(min_per_star))
-
-def rank_z_by_match(z_values_all, basepath, star_coords_tuple):
+def rank_z_by_match_require_kd(z_values_all, basepath, star_coords_tuple):
     """
-    For each Z, load isochrone age points (cached arrays) and compute best age score (mean minimal dist).
+    For each Z, load isochrone age points (cached arrays) and compute best age score using KD only.
     Returns list [(z, best_age_years_or_None, best_score), ...] sorted by score ascending.
+    If KD implementation missing, returns all np.inf scores and emits an error later in UI.
     """
     results = []
-    # convert star_coords_tuple (hashable) to numpy array for computations
     if not star_coords_tuple:
         return [(z, None, np.inf) for z in z_values_all]
     star_coords_arr = np.array([list(t) for t in star_coords_tuple])  # shape (M,2)
@@ -227,12 +220,14 @@ def rank_z_by_match(z_values_all, basepath, star_coords_tuple):
 
         best_age = None
         best_score = np.inf
+        # iterate ages and demand KD-based distances
         for age, pts in age_pts.items():
-            s = kd_mean_distance_to_points(pts, star_coords_arr)
+            s = kd_mean_distance_to_points_using_kd(pts, star_coords_arr)
             if s < best_score:
                 best_score = s
                 best_age = age
         results.append((z, best_age, best_score))
+    # sort such that finite scores come first
     results.sort(key=lambda t: (t[2] == np.inf, t[2]))
     return results
 
@@ -243,17 +238,20 @@ if 'session_start' not in st.session_state:
     st.session_state['session_start'] = time.time()
 
 session_run_time = time.time() - st.session_state['session_start']
+# clear after 15 minutes to avoid stale state (same behavior as before)
 if session_run_time > 900:
     st.session_state.clear()
 
 st.set_page_config(layout='centered')
 
-st.title('HR Diagram Plotter — KD-tree safe caching fix (robust rerun)')
+st.title('HR Diagram Plotter — KD-only suggestions, auto-applied')
 st.markdown("""
-This version avoids calling `st.experimental_rerun()` unguarded. If your Streamlit build lacks `experimental_rerun`, the app falls back to setting a session flag and calling `st.stop()` to prevent the AttributeError.
+This version **requires** a KD-tree implementation (`scipy` or `scikit-learn`).  
+It automatically applies the top metallicity (Z) and top ages after you press **Apply star inputs**.  
+If you prefer a different selection, just change the multiselects manually.
 """)
 
-# 1) Collect star inputs in a form
+# 1) Collect star inputs inside a form
 with st.form("star_input_form", clear_on_submit=False):
     st.subheader("1) Star inputs (press Apply star inputs when done)")
     star_identifier = st.text_input("Star identifier:", value=st.session_state.get("star_identifier", ""))
@@ -328,6 +326,7 @@ with st.form("star_input_form", clear_on_submit=False):
             st.session_state[f'comp{i+1}_color'] = color
 
         if valid:
+            # store computed star coords + metadata
             st.session_state['star_identifier'] = star_identifier
             st.session_state['num_stars'] = int(num_stars)
             st.session_state['star_names'] = final_names
@@ -335,15 +334,15 @@ with st.form("star_input_form", clear_on_submit=False):
             st.session_state['star_colors'] = final_colors
             st.session_state['star_x'] = x_list
             st.session_state['star_y'] = y_list
-            st.success("Star inputs applied — suggestions will be computed below.")
+            st.success("Star inputs applied — suggestions computed below (KD-only).")
 
-# initialize used_colors
+# initialize used_colors set (for color assignment)
 used_colors = set()
 
-# z candidates
+# candidate metallicities
 z_range = [0.0004, 0.008, 0.019, 0.03]
 
-# retrieve star coords from session_state (if present)
+# retrieve star coords from session_state
 star_x = st.session_state.get('star_x', [])
 star_y = st.session_state.get('star_y', [])
 star_names = st.session_state.get('star_names', [])
@@ -351,69 +350,53 @@ star_sizes = st.session_state.get('star_sizes', [])
 star_colors = st.session_state.get('star_colors', [])
 star_identifier = st.session_state.get('star_identifier', "")
 
-suggested_zs = []
-z_rank_results = []
-if star_x and star_y:
-    # convert to a hashable tuple of tuples for safe passing
-    star_coords_tuple = tuple((float(x), float(y)) for x, y in zip(star_x, star_y))
-    with st.spinner("Ranking metallicities (KD-tree matching)..."):
-        z_rank_results = rank_z_by_match(tuple(z_range), ".", star_coords_tuple)
-    finite_results = [r for r in z_rank_results if r[2] != np.inf]
-    if finite_results:
-        suggested_zs = [finite_results[0][0]]
+# If KD implementation not present, inform user and skip auto-suggestions
+if KDTreeImpl is None:
+    st.error("KD-tree implementation not found. Please install `scipy` (recommended) or `scikit-learn`. Without KD the app will not suggest metallicity/age automatically.")
+    z_rank_results = []
+    suggested_zs = []
 else:
-    if KDTreeImpl is None:
-        pass
+    # Compute suggestions automatically if we have star coords
+    suggested_zs = []
+    z_rank_results = []
+    if star_x and star_y:
+        star_coords_tuple = tuple((float(x), float(y)) for x, y in zip(star_x, star_y))
+        with st.spinner("Ranking metallicities (KD-tree matching)..."):
+            z_rank_results = rank_z_by_match_require_kd(tuple(z_range), ".", star_coords_tuple)
+        finite_results = [r for r in z_rank_results if r[2] != np.inf]
+        if finite_results:
+            # auto-apply best Z and compute default top ages for that Z
+            best_z = finite_results[0][0]
+            suggested_zs = [best_z]
+            st.session_state['selected_z_values'] = suggested_zs
 
-# Show ranking table
+            # compute top N ages for best_z using KD
+            fname = f"cleaned_Z={best_z}_age.csv"
+            if os.path.exists(fname):
+                age_pts = load_iso_age_points(fname)
+                top_n = 3
+                age_scores = []
+                star_coords_arr = np.array([list(t) for t in star_coords_tuple])
+                for age, pts in age_pts.items():
+                    s = kd_mean_distance_to_points_using_kd(pts, star_coords_arr)
+                    age_scores.append((age, s))
+                age_scores.sort(key=lambda t: t[1])
+                top_ages = [round(a / 1e9, 4) for a, sc in age_scores[:top_n] if sc != np.inf]
+                st.session_state[f'age_defaults_z{best_z}'] = top_ages
+
+# Display ranking table (if any results)
 if z_rank_results:
     st.subheader("Z ranking (best matches first)")
     rows = []
     for z, best_age, score in z_rank_results:
         if score == np.inf:
-            rows.append({"Z": z, "Best age (Gyr)": "N/A", "Score": "N/A (file missing or no data)"})
+            rows.append({"Z": z, "Best age (Gyr)": "N/A", "Score": "N/A (file missing or no KD match)"})
         else:
             ag_gyr = round(best_age / 1e9, 4) if best_age is not None else "N/A"
             rows.append({"Z": z, "Best age (Gyr)": ag_gyr, "Score": f"{score:.6e}"})
     st.table(ps.DataFrame(rows))
 
-# Apply top suggestions button (prefill selectors)
-if suggested_zs:
-    if st.button("Apply top suggestions (prefill best Z and top ages)"):
-        st.session_state['selected_z_values'] = suggested_zs
-        # compute top ages defaults for each top z and store in session_state
-        star_coords_arr = np.array([list(t) for t in tuple((float(x), float(y)) for x, y in zip(star_x, star_y))])
-        for z in suggested_zs:
-            fname = f"cleaned_Z={z}_age.csv"
-            if not os.path.exists(fname):
-                continue
-            age_pts = load_iso_age_points(fname)
-            age_scores = []
-            for age, pts in age_pts.items():
-                s = kd_mean_distance_to_points(pts, star_coords_arr)
-                age_scores.append((age, s))
-            age_scores.sort(key=lambda t: t[1])
-            top_ages = [round(a / 1e9, 4) for a, sc in age_scores[:3] if sc != np.inf]
-            st.session_state[f'age_defaults_z{z}'] = top_ages
-
-        # safe rerun strategy:
-        if hasattr(st, "experimental_rerun") and callable(st.experimental_rerun):
-            try:
-                st.experimental_rerun()
-            except Exception:
-                # fall back to stop + flag
-                st.session_state['needs_rerun'] = True
-                st.stop()
-        else:
-            st.session_state['needs_rerun'] = True
-            st.stop()
-
-# If a previous branch set the needs_rerun flag, clear it and continue (this ensures single-run behavior)
-if st.session_state.get('needs_rerun', False):
-    # clear flag so we don't loop forever
-    st.session_state['needs_rerun'] = False
-
-# Z and ages multiselect UI
+# Z and ages multiselect UI (defaults auto-applied from session_state if available)
 st.subheader("Select metallicities (Z) and isochrone ages")
 z_default = st.session_state.get('selected_z_values', suggested_zs)
 z_values = st.multiselect('Metallicities (Z):', z_range, default=z_default, key='multiselect_z')
@@ -440,6 +423,7 @@ for z in z_values:
 
     isoc_data_dict[z] = []
     available_ages = get_available_ages(isochrones_df)
+    # Default ages come from session_state age_defaults_z{z} (auto-suggested) or previous selection
     age_default = st.session_state.get(f'age_select_z{z}') or st.session_state.get(f'age_defaults_z{z}') or []
     age_values = st.multiselect(f'Isochrone ages (Gyr) for Z={z}:', available_ages, default=age_default, key=f'age_select_z{z}')
 
@@ -450,7 +434,7 @@ for z in z_values:
             if f'z{z}_a{age}' not in st.session_state:
                 st.session_state[f'z{z}_a{age}'] = get_plot_color()
 
-# Plotting
+# Plotting (unchanged)
 hr_fig = hr_ax = mass_et_list = None
 if z_values and et_data_dict and star_identifier and 0 < len(star_names) == len(star_sizes) == len(star_colors) == len(star_x) == len(star_y):
     hr_fig, hr_ax, mass_et_list = plot_evol_tracks_isoc_hr(z_values, et_data_dict, isoc_data_dict, star_identifier, star_names, star_sizes, star_colors, star_x, star_y)
