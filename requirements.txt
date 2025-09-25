@@ -2,5 +2,5 @@ streamlit
 numpy
 pandas
 matplotlib
-scipy
-
+scipy   # preferred; provides cKDTree and is fast
+scikit-learn  # optional fallback if scipy is not available
