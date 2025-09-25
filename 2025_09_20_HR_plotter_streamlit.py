@@ -162,32 +162,42 @@ def load_iso_age_points(filename):
         pts = np.vstack([df_age['LogT'].values, df_age['LogL'].values]).T
         if pts.size == 0:
             continue
-        out[int(age)] = pts  # use int/float keys (years)
+        out[int(age)] = pts
     return out
 
-def kd_mean_distance_to_points(pts, star_coords):
+def kd_mean_distance_to_points(pts, star_coords_arr):
     """
-    Given pts (Nx2) and star_coords (list/array Mx2), compute mean of minimal Euclidean distances
-    from each star to the pts. If KD-tree implementation is available, use it; otherwise use vectorized fallback.
+    Given pts (Nx2) and star_coords_arr (Mx2 numpy array or convertible), compute mean of minimal Euclidean distances
+    from each star to the pts. Uses KD-tree if available; otherwise a vectorized fallback.
     """
-    if pts is None or pts.size == 0 or not star_coords:
+    # explicit checks (avoid truth-testing numpy)
+    if pts is None or getattr(pts, "size", 0) == 0:
         return np.inf
-    arr = np.asarray(star_coords)
+    if star_coords_arr is None:
+        return np.inf
+    star_arr = np.asarray(star_coords_arr)
+    if star_arr.size == 0:
+        return np.inf
+
+    # prefer KD-tree implementation if available
     if KDTreeImpl is not None:
         try:
             tree = KDTreeImpl(pts)
-            # query returns distances
-            dists = tree.query(arr, k=1)[0]
-            dists = np.asarray(dists).reshape(-1)
+            # query returns distances; different KD impls return slightly different shapes
+            res = tree.query(star_arr, k=1)
+            # res may be (dists, idx) or a single array depending on impl; handle generically:
+            if isinstance(res, tuple) and len(res) >= 1:
+                dists = np.asarray(res[0]).reshape(-1)
+            else:
+                dists = np.asarray(res).reshape(-1)
             return float(np.mean(dists))
         except Exception:
             # fall through to fallback
             pass
-    # fallback: vectorized computation (may be slower)
-    # compute distances star x pts -> take min over pts for each star
-    # arr shape (M,2), pts shape (N,2)
-    diff = arr[:, None, :] - pts[None, :, :]  # shape (M, N, 2)
-    dists = np.sqrt(np.sum(diff ** 2, axis=2))  # (M,N)
+
+    # fallback: vectorized computation (M x N distances -> min over N)
+    diff = star_arr[:, None, :] - pts[None, :, :]  # (M, N, 2)
+    dists = np.sqrt(np.sum(diff ** 2, axis=2))  # (M, N)
     min_per_star = np.min(dists, axis=1)
     return float(np.mean(min_per_star))
 
@@ -195,10 +205,9 @@ def rank_z_by_match(z_values_all, basepath, star_coords_tuple):
     """
     For each Z, load isochrone age points (cached arrays) and compute best age score (mean minimal dist).
     Returns list [(z, best_age_years_or_None, best_score), ...] sorted by score ascending.
-    NOTE: star_coords_tuple must be a tuple of tuples so it's hashable if passed to any cached function.
     """
     results = []
-    # star_coords_tuple -> convert to numpy array for computations
+    # convert star_coords_tuple (hashable) to numpy array for computations
     if not star_coords_tuple:
         return [(z, None, np.inf) for z in z_values_all]
     star_coords_arr = np.array([list(t) for t in star_coords_tuple])  # shape (M,2)
@@ -224,7 +233,6 @@ def rank_z_by_match(z_values_all, basepath, star_coords_tuple):
                 best_score = s
                 best_age = age
         results.append((z, best_age, best_score))
-    # sort: finite scores first by score (ascending)
     results.sort(key=lambda t: (t[2] == np.inf, t[2]))
     return results
 
@@ -240,10 +248,9 @@ if session_run_time > 900:
 
 st.set_page_config(layout='centered')
 
-st.title('HR Diagram Plotter — KD-tree safe caching fix')
+st.title('HR Diagram Plotter — KD-tree safe caching fix (bugfix)')
 st.markdown("""
-This version fixes Streamlit caching errors by caching only simple data (arrays/dataframes) and
-building KD-trees on the fly for matching.
+This fixes the ambiguous truth-value bug by explicitly checking numpy array sizes.
 """)
 
 # 1) Collect star inputs in a form
@@ -354,10 +361,8 @@ if star_x and star_y:
     finite_results = [r for r in z_rank_results if r[2] != np.inf]
     if finite_results:
         suggested_zs = [finite_results[0][0]]
-
 else:
     if KDTreeImpl is None:
-        # No KD-tree available; we can still run with fallback if user presses Apply star inputs later
         pass
 
 # Show ranking table
