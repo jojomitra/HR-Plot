@@ -244,7 +244,7 @@ if session_run_time > 900:
 
 st.set_page_config(layout='centered')
 
-st.title('HR Diagram Plotter — KD-only suggestions, auto-applied')
+st.title('HR Diagram Plotter — k-d tree nearest neighbor')
 st.markdown("""
 This version **requires** a KD-tree implementation (`scipy` or `scikit-learn`).  
 It automatically applies the top metallicity (Z) and top ages after you press **Apply star inputs**.  
@@ -334,7 +334,7 @@ with st.form("star_input_form", clear_on_submit=False):
             st.session_state['star_colors'] = final_colors
             st.session_state['star_x'] = x_list
             st.session_state['star_y'] = y_list
-            st.success("Star inputs applied — suggestions computed below (KD-only).")
+            st.success("Star inputs applied and suggestions computed below.")
 
 # initialize used_colors set (for color assignment)
 used_colors = set()
