@@ -248,9 +248,9 @@ if session_run_time > 900:
 
 st.set_page_config(layout='centered')
 
-st.title('HR Diagram Plotter — KD-tree safe caching fix (bugfix)')
+st.title('HR Diagram Plotter — KD-tree safe caching fix (robust rerun)')
 st.markdown("""
-This fixes the ambiguous truth-value bug by explicitly checking numpy array sizes.
+This version avoids calling `st.experimental_rerun()` unguarded. If your Streamlit build lacks `experimental_rerun`, the app falls back to setting a session flag and calling `st.stop()` to prevent the AttributeError.
 """)
 
 # 1) Collect star inputs in a form
@@ -395,7 +395,23 @@ if suggested_zs:
             age_scores.sort(key=lambda t: t[1])
             top_ages = [round(a / 1e9, 4) for a, sc in age_scores[:3] if sc != np.inf]
             st.session_state[f'age_defaults_z{z}'] = top_ages
-        st.experimental_rerun()
+
+        # safe rerun strategy:
+        if hasattr(st, "experimental_rerun") and callable(st.experimental_rerun):
+            try:
+                st.experimental_rerun()
+            except Exception:
+                # fall back to stop + flag
+                st.session_state['needs_rerun'] = True
+                st.stop()
+        else:
+            st.session_state['needs_rerun'] = True
+            st.stop()
+
+# If a previous branch set the needs_rerun flag, clear it and continue (this ensures single-run behavior)
+if st.session_state.get('needs_rerun', False):
+    # clear flag so we don't loop forever
+    st.session_state['needs_rerun'] = False
 
 # Z and ages multiselect UI
 st.subheader("Select metallicities (Z) and isochrone ages")
